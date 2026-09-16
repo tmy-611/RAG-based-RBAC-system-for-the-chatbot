@@ -14,7 +14,7 @@ users_db: Dict[str, Dict[str, str]] = {
     "Sam": {"password": "financepass", "role": "finance"},
     "Peter": {"password": "pete123", "role": "engineering"},
     "Sid": {"password": "sidpass123", "role": "marketing"},
-    "Natasha": {"passwoed": "hrpass123", "role": "hr"}
+    "Natasha": {"password": "hrpass123", "role": "hr"}
 }
 
 
