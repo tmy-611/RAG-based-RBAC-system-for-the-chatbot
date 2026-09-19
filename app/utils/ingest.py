@@ -25,7 +25,11 @@ from langchain_chroma import Chroma
 from langchain_community.document_loaders import CSVLoader
 from langchain_core.documents import Document
 from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_text_splitters import (MarkdownHeaderTextSplitter, RecursiveCharacterTextSplitter)
+from dotenv import load_dotenv
+
+load_dotenv()
+
 
 # --- Shared constants (STEP 3 imports these for retrieval) ---
 BASE_DIR = Path(__file__).resolve().parents[2]  # <root>/app/utils/ingest.py -> <root>
@@ -36,29 +40,78 @@ EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 
 CHUNK_SIZE = 1000
 CHUNK_OVERLAP = 200
+HEADERS_TO_SPLIT_ON = [("#", "h1"), ("##", "h2"), ("###", "h3")]
 
 
-def load_markdown(path: Path, department: str, converter: DocumentConverter) -> str:
-    """Parse a .md file with Docling, return clean markdown text."""
-    result = converter.convert(str(path))
-    return result.document.export_to_markdown()
+def _parent_key(path: Path, metadata: dict) -> str:
+    """Section key used to group chunks for small-to-big context expansion."""
+    section = metadata.get("h2") or metadata.get("h1") or "root"
+    return f"{path.name}::{section}"
+
+
+def load_markdown(path: Path, department: str, converter: DocumentConverter) -> list[Document]:
+    """Parse .md with Docling, split by heading, store parent text per chunk.
+
+    Small chunks are embedded for precise retrieval, while ``parent_text``
+    holds the whole parent section so retrieval can expand back to it.
+    """
+    text = converter.convert(str(path)).document.export_to_markdown()
+
+    header_splitter = MarkdownHeaderTextSplitter(
+        headers_to_split_on=HEADERS_TO_SPLIT_ON
+    )
+    overflow_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP
+    )
+    sections = header_splitter.split_text(text)
+
+    # Group raw section bodies (and titles) so each chunk can carry its parent.
+    parent_titles: dict[str, str] = {}
+    parent_bodies: dict[str, list[str]] = {}
+    for section in sections:
+        key = _parent_key(path, section.metadata)
+        parent_titles.setdefault(
+            key,
+            section.metadata.get("h2") or section.metadata.get("h1") or path.stem,
+        )
+        parent_bodies.setdefault(key, []).append(section.page_content)
+
+    docs: list[Document] = []
+    for section in sections:
+        parent_id = _parent_key(path, section.metadata)
+        heading_path = " > ".join(str(v) for v in section.metadata.values())
+        body = section.page_content
+        if heading_path:
+            body = f"{heading_path}\n\n{body}"
+        section.page_content = body
+        section.metadata["department"] = department
+        section.metadata["source"] = path.name
+        section.metadata["parent_id"] = parent_id
+        section.metadata["parent_text"] = (
+            f"{parent_titles[parent_id]}\n\n" + "\n\n".join(parent_bodies[parent_id])
+        )
+        # Header sections can still exceed the embedding window: cap them.
+        if len(body) > CHUNK_SIZE:
+            docs.extend(overflow_splitter.split_documents([section]))
+        else:
+            docs.append(section)
+    return docs
 
 
 def load_csv_rows(path: Path, department: str) -> list[Document]:
-    """Load a .csv file with CSVLoader, tagging every row with its department."""
+    """Load a .csv file with CSVLoader; each row is its own parent section."""
     docs = CSVLoader(file_path=str(path), encoding="utf-8").load()
     for doc in docs:
         doc.metadata["department"] = department
         doc.metadata["source"] = path.name
+        doc.metadata["parent_id"] = f"{path.name}::row::{doc.metadata.get('row', 0)}"
+        doc.metadata["parent_text"] = doc.page_content
     return docs
 
 
 def build_documents() -> tuple[list[Document], dict[str, int]]:
     """Walk DATA_DIR, return (chunks, per-department file counts)."""
     converter = DocumentConverter()
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP
-    )
     chunks: list[Document] = []
     file_counts: dict[str, int] = {}
 
@@ -67,14 +120,7 @@ def build_documents() -> tuple[list[Document], dict[str, int]]:
         file_counts[department] = 0
         for path in sorted(dept_dir.iterdir()):
             if path.suffix.lower() == ".md":
-                text = load_markdown(path, department, converter)
-                if not text.strip():
-                    continue
-                doc = Document(
-                    page_content=text,
-                    metadata={"department": department, "source": path.name},
-                )
-                chunks.extend(splitter.split_documents([doc]))
+                chunks.extend(load_markdown(path, department, converter))
                 file_counts[department] += 1
             elif path.suffix.lower() == ".csv":
                 chunks.extend(load_csv_rows(path, department))
